@@ -40,9 +40,6 @@ pipeline {
 
     post {
         failure {
-            withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_URL')]) {
-                sh '''curl -s -X POST -H "Content-type: application/json" --data "{\\"text\\":\\":x: FAILED: $JOB_NAME #$BUILD_NUMBER - $BUILD_URL\\"}" "$SLACK_URL"'''
-            }
             mail to: 'rafters567@gmail.com',
                  subject: "FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
                  body: "The build failed.\n\nConsole output: ${env.BUILD_URL}console"
