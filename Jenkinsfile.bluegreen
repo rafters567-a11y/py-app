@@ -1,0 +1,164 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(name: 'SIMULATE_FAILURE', choices: ['none', 'smoke', 'post-switch'],
+               description: 'Force a failure to test rollback')
+    }
+
+    environment {
+        IMAGE      = 'py-app'
+        TAG        = "${env.BUILD_NUMBER}"
+        BG_DIR     = '/var/lib/jenkins/bluegreen'
+        NET        = 'bg-net'
+        PROXY      = 'bg-proxy'
+        PROXY_PORT = '80'
+    }
+
+    options {
+        timeout(time: 20, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Clone') {
+            steps { checkout scm }
+        }
+
+        stage('Validate') {
+            steps {
+                sh 'docker run --rm -v "$PWD":/src -w /src python:3.11-slim python -m py_compile app.py'
+            }
+        }
+
+        stage('Build image') {
+            steps {
+                sh 'docker build -t ${IMAGE}:${TAG} -t ${IMAGE}:latest .'
+            }
+        }
+
+        stage('Prepare infrastructure') {
+            steps {
+                sh '''
+                    mkdir -p "$BG_DIR/conf"
+                    docker network inspect $NET >/dev/null 2>&1 || docker network create $NET
+                    [ -f "$BG_DIR/conf/default.conf" ] || sh switch-traffic.sh blue
+                    if [ -z "$(docker ps -q -f name=^${PROXY}$)" ]; then
+                        docker rm -f $PROXY 2>/dev/null || true
+                        docker run -d --name $PROXY --network $NET --restart unless-stopped \
+                            -p ${PROXY_PORT}:80 -v "$BG_DIR/conf":/etc/nginx/conf.d:ro nginx:alpine
+                    fi
+                '''
+            }
+        }
+
+        stage('Pick target colour') {
+            steps {
+                script {
+                    def active = sh(script: 'cat "$BG_DIR/active" 2>/dev/null || true',
+                                    returnStdout: true).trim()
+                    env.PREV        = (active == 'blue' || active == 'green') ? active : ''
+                    env.TARGET      = (env.PREV == 'blue') ? 'green' : 'blue'
+                    env.TARGET_PORT = (env.TARGET == 'blue') ? '8101' : '8102'
+                    echo "Live: ${env.PREV ?: 'none'}  ->  deploying to idle colour: ${env.TARGET}"
+                }
+            }
+        }
+
+        stage('Deploy to idle') {
+            steps {
+                sh '''
+                    docker rm -f app-$TARGET 2>/dev/null || true
+                    docker run -d --name app-$TARGET --network $NET --restart unless-stopped \
+                        -p 127.0.0.1:$TARGET_PORT:8000 ${IMAGE}:${TAG}
+                '''
+            }
+        }
+
+        stage('Smoke test (idle)') {
+            steps {
+                sh '''
+                    if [ "$SIMULATE_FAILURE" = "smoke" ]; then
+                        echo "Simulated smoke-test failure"; exit 1
+                    fi
+                    for i in $(seq 1 15); do
+                        if curl -fsS -m 3 http://127.0.0.1:$TARGET_PORT/ | grep -q ok; then
+                            echo "app-$TARGET is healthy"; exit 0
+                        fi
+                        sleep 2
+                    done
+                    docker logs app-$TARGET || true
+                    exit 1
+                '''
+            }
+        }
+
+        stage('Switch traffic') {
+            steps {
+                script { env.SWITCHED = 'true' }
+                sh '''
+                    sh switch-traffic.sh $TARGET
+                    docker exec $PROXY nginx -t
+                    docker exec $PROXY nginx -s reload
+                    echo $TARGET > "$BG_DIR/active"
+                '''
+            }
+        }
+
+        stage('Verify live traffic') {
+            steps {
+                sh '''
+                    if [ "$SIMULATE_FAILURE" = "post-switch" ]; then
+                        echo "Simulated post-switch failure"; exit 1
+                    fi
+                    for i in $(seq 1 10); do
+                        if curl -fsS -m 5 -D - -o /dev/null http://127.0.0.1:${PROXY_PORT}/ \
+                             | grep -qi "x-active-color: $TARGET"; then
+                            echo "Live traffic is on $TARGET"; exit 0
+                        fi
+                        sleep 2
+                    done
+                    exit 1
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Deployed ${env.IMAGE}:${env.TAG} to ${env.TARGET}. Old colour (${env.PREV ?: 'none'}) kept as standby."
+        }
+        failure {
+            script {
+                def note = 'Failed before any deployment happened.'
+                if (env.SWITCHED == 'true' && env.PREV) {
+                    echo "ROLLBACK: sending traffic back to ${env.PREV}"
+                    sh '''
+                        sh switch-traffic.sh $PREV
+                        docker exec $PROXY nginx -s reload
+                        echo $PREV > "$BG_DIR/active"
+                        docker rm -f app-$TARGET || true
+                    '''
+                    note = "Rolled back automatically. Traffic is back on ${env.PREV}."
+                } else if (env.TARGET) {
+                    sh 'docker rm -f app-$TARGET || true'
+                    note = env.SWITCHED == 'true'
+                        ? 'First deployment failed and there is no previous version to roll back to.'
+                        : "Smoke test or deploy failed. Traffic was never switched; ${env.PREV ?: 'no version'} is still live."
+                }
+                echo note
+                mail to: 'rafters567@gmail.com',
+                     subject: "FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                     body: "${note}\n\nConsole output: ${env.BUILD_URL}console"
+            }
+        }
+        always {
+            sh '''
+                docker image prune -f
+                docker images $IMAGE --format '{{.Tag}}' | grep -E '^[0-9]+$' | sort -n | head -n -4 \
+                    | xargs -r -I{} docker rmi $IMAGE:{} 2>/dev/null || true
+            '''
+        }
+    }
+}
