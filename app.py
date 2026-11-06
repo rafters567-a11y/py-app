@@ -4,4 +4,3 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     return "ok"
-def broken(:
